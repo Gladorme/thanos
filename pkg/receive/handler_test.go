@@ -2130,6 +2130,70 @@ func TestRelabelPerTenant(t *testing.T) {
 	}
 }
 
+func TestRelabelPerTenantWithSplitTenantLabel(t *testing.T) {
+	t.Parallel()
+
+	const tenantLabelName = "thanos_tenant_id"
+
+	dropMetric := func(regex string) []*relabel.Config {
+		return []*relabel.Config{{
+			SourceLabels:         model.LabelNames{"__name__"},
+			Action:               relabel.Drop,
+			Regex:                relabel.MustNewRegexp(regex),
+			NameValidationScheme: model.UTF8Validation,
+		}}
+	}
+
+	h := NewHandler(nil, &Options{
+		SplitTenantLabelName: tenantLabelName,
+		RelabelConfigs:       dropMetric("global_drop"),
+		TenantRelabelConfigs: map[string][]*relabel.Config{
+			"tenant-a":       dropMetric("tenant_a_drop"),
+			"header-tenant":  dropMetric("header_drop"),
+			"tenant-no-rule": {},
+		},
+	})
+
+	series := func(name, tenant string) prompb.TimeSeries {
+		lbls := labels.FromStrings("__name__", name)
+		if tenant != "" {
+			lbls = labels.FromStrings("__name__", name, tenantLabelName, tenant)
+		}
+		return prompb.TimeSeries{
+			Labels:  labelpb.ZLabelsFromPromLabels(lbls),
+			Samples: []prompb.Sample{{Timestamp: 0, Value: 1}},
+		}
+	}
+
+	wreq := prompb.WriteRequest{Timeseries: []prompb.TimeSeries{
+		// Split label tenant rules apply, not the header tenant's.
+		series("tenant_a_drop", "tenant-a"),
+		series("header_drop", "tenant-a"),
+		// No split label: header tenant rules apply.
+		series("header_drop", ""),
+		series("tenant_a_drop", ""),
+		// Split label tenant without rules falls back to global.
+		series("global_drop", "tenant-b"),
+		series("header_drop", "tenant-b"),
+		// Split label tenant with empty rules is left untouched.
+		series("global_drop", "tenant-no-rule"),
+	}}
+
+	h.relabel(&wreq, "header-tenant")
+
+	var got []string
+	for _, ts := range wreq.Timeseries {
+		lbls := labelpb.ZLabelsToPromLabels(ts.Labels)
+		got = append(got, lbls.Get("__name__")+"/"+lbls.Get(tenantLabelName))
+	}
+	testutil.Equals(t, []string{
+		"header_drop/tenant-a",
+		"tenant_a_drop/",
+		"header_drop/tenant-b",
+		"global_drop/tenant-no-rule",
+	}, got)
+}
+
 func TestGetStatsLimitParameter(t *testing.T) {
 	t.Parallel()
 
